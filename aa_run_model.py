@@ -1,17 +1,5 @@
-# -*- coding: utf-8 -*-
+# File: hmg/test/aa_run_model.py
 
-'''
-@author: Faizan-TU Munich
-
-21.10.2025
-
-09:31:38
-
-Description: Demonstration of 1D 001A variant of HBV.
-
-Keywords:
-
-'''
 
 import os
 import sys
@@ -22,263 +10,404 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
 import matplotlib.pyplot as plt
 
-import sys, os
-sys.path.append(os.path.expanduser('~/Downloads'))
-import hmg
+
+sys.path.append(os.path.expanduser("~/.local/lib/python3.11/site-packages"))
+from hmg import HBV001A  
+
+from scipy.optimize import differential_evolution
+from scipy.stats import spearmanr
 
 
+# Parameter names in model order 
+
+PARAM_NAMES = [
+    "snw_dth","snw_att","snw_pmf","snw_amf",
+    "sl0_dth","sl0_pwp","sl0_fcy","sl0_bt0",
+    "urr_dth","lrr_dth",
+    "urr_wsr","urr_ulc","urr_tdh","urr_tdr","urr_ndr","urr_uct",
+    "lrr_dre","lrr_lct"
+]
 
 
-from hmg import HBV001A
+# Bounds for DE
 
-DEBUG_FLAG = False
+BOUNDS = [
+    (0.00, 0.00),   # snw_dth  (fixed 0)
+    (-2.0, 3.0),    # snw_att
+    (0.00, 3.00),   # snw_pmf
+    (0.00, 10.0),   # snw_amf
+
+    (0.00, 100.0),  # sl0_dth
+    (5.00, 700.0),  # sl0_pwp
+    (100.0, 700.0), # sl0_fcy
+    (0.01, 10.0),   # sl0_bt0
+
+    (0.00, 20.0),   # urr_dth
+    (0.00, 100.0),  # lrr_dth
+
+    (0.00, 1.00),   # urr_wsr
+    (0.00, 1.00),   # urr_ulc
+    (0.00, 200.0),  # urr_tdh
+    (0.01, 1.00),   # urr_tdr
+    (0.00, 1.00),   # urr_ndr
+    (0.00, 1.00),   # urr_uct
+
+    (0.00, 1.00),   # lrr_dre
+    (0.00, 1.00),   # lrr_lct
+]
+
+# Helpers
+
+def calc_nse(obs: np.ndarray, sim: np.ndarray) -> float:
+    """Compute NSE."""
+    obs = np.asarray(obs, float)
+    sim = np.asarray(sim, float)
+    mask = np.isfinite(obs) & np.isfinite(sim)
+    obs = obs[mask]; sim = sim[mask]
+    denom = np.sum((obs - obs.mean()) ** 2)
+    if denom <= 0:
+        return float("-inf")
+    return 1.0 - np.sum((obs - sim) ** 2) / denom
+
+
+def build_model(tems, ppts, pets, tsps, dslr) -> HBV001A:
+    """Construct and initialize HBV001A for a run."""
+    m = HBV001A()
+    m.set_inputs(tems, ppts, pets)
+    m.set_outputs(tsps)
+    m.set_discharge_scaler(dslr)
+    m.set_optimization_flag(0)  # why: we optimize externally
+    return m
+
+
+def objective_function(params, tems, ppts, pets, tsps, dslr, diso):
+    """Clamp params, run model, return (ofv=1-NSE, {'NSE': nse}, sim)."""
+    p = np.asarray(params, float).copy()
+    for i, (lo, hi) in enumerate(BOUNDS):
+        p[i] = np.clip(p[i], lo, hi)
+    m = build_model(tems, ppts, pets, tsps, dslr)
+    try:
+        m.set_parameters(p)
+    except AssertionError:
+        return 1e6, {"NSE": float("-inf")}, None  
+    m.run_model()
+    sim = m.get_discharge()
+    nse = calc_nse(diso, sim)
+    ofv = 1.0 - nse if np.isfinite(nse) else 1e6
+    return ofv, {"NSE": float(nse)}, sim
+
+
+def plot_obs_sim(index, obs, sim, title, out_png):
+    fig = plt.figure(figsize=(6, 3), dpi=120)
+    plt.plot(index, obs, label="OBS", alpha=0.85)
+    plt.plot(index, sim, label="SIM", alpha=0.85)
+    plt.grid(True); plt.legend()
+    plt.xticks(rotation=45)
+    plt.xlabel("Time [hr]"); plt.ylabel("Discharge [m³/s]")
+    plt.title(title)
+    plt.tight_layout(); plt.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.show(); plt.close(fig)
+
+
+def plot_convergence(best_list, out_png="de_convergence.png"):
+    if not best_list:
+        return
+    fig, ax = plt.subplots(figsize=(5, 3), dpi=120)
+    ax.plot(best_list, lw=2)
+    ax.set_xlabel("Generation"); ax.set_ylabel("Objective (1 - NSE)")
+    ax.set_title("DE Convergence"); ax.grid(True)
+    fig.tight_layout(); fig.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.show(); plt.close(fig)
+
+
+def plot_param_paths(best_params_by_gen, out_dir=".", prefix="param_path_"):
+    """Plot step trajectories of current-best parameter vs generation."""
+    if not best_params_by_gen:
+        return
+    arr = np.vstack(best_params_by_gen)  # (G, P)
+    gens = np.arange(arr.shape[0])
+    for j, name in enumerate(PARAM_NAMES):
+        fig = plt.figure(figsize=(6, 6), dpi=120)
+        plt.step(gens, arr[:, j], where="post")
+        plt.grid(True)
+        plt.xlabel("Generation number [-]")
+        plt.ylabel(f"{name.upper()} [-]")  # why: generic units
+        plt.title(f"{name.upper()} vs Generation")
+        plt.tight_layout()
+        out_png = os.path.join(out_dir, f"{prefix}{name.lower()}.png")
+        plt.savefig(out_png, dpi=200, bbox_inches="tight")
+        plt.show(); plt.close(fig)
+
+
+def plot_internal_vars(index, df, otps, labels, title, out_png):
+    fig, axs = plt.subplots(8, 1, figsize=(6, 9), dpi=120, sharex=True)
+    (axs_tem, axs_ppt, axs_snw, axs_sl0, axs_etn, axs_rrr, axs_rnf, axs_bal) = axs
+
+    axs_tem.plot(df["tavg__ref"], alpha=0.85); axs_tem.set_ylabel("TEM\n[°C]")
+    axs_ppt.plot(df["pptn__ref"], alpha=0.85); axs_ppt.set_ylabel("PPT\n[mm]")
+
+    axs_snw.plot(index, otps[:, labels["snw_dth"]], alpha=0.85); axs_snw.set_ylabel("SNW\n[mm]")
+    axs_sl0.plot(index, otps[:, labels["sl0_dth"]], alpha=0.85); axs_sl0.set_ylabel("SL0\n[mm]")
+
+    axs_etn.plot(index, df["petn__ref"], label="PET", alpha=0.85)
+    axs_etn.plot(index, otps[:, labels["sl0_etn"]], label="ETN", alpha=0.85)
+    axs_etn.legend(); axs_etn.set_ylabel("ETN\n[mm]")
+
+    axs_rrr.plot(index, otps[:, labels["urr_dth"]], label="URR", alpha=0.85)
+    axs_rrr.plot(index, otps[:, labels["lrr_dth"]], label="LRR", alpha=0.85)
+    axs_rrr.legend(); axs_rrr.set_ylabel("DTH\n[mm]")
+
+    axs_rnf.plot(index, otps[:, labels["chn_pow"]], label="SFC", alpha=0.85)
+    axs_rnf.plot(index, otps[:, labels["urr_urf"]] + otps[:, labels["lrr_lrf"]], label="GND", alpha=0.85)
+    axs_rnf.legend(); axs_rnf.set_ylabel("RNF\n[mm]")
+
+    axs_bal.plot(index, otps[:, labels["mod_bal"]], alpha=0.85); axs_bal.set_ylabel("BAL\n[mm]")
+
+    for ax in axs: ax.grid(True)
+    axs[-1].set_xlabel("Time [hr]")
+    plt.xticks(rotation=45)
+    plt.suptitle(title)
+    plt.tight_layout(); plt.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.show(); plt.close(fig)
+
+
+def run_with_params(params, tems, ppts, pets, tsps, dslr, diso):
+    m = build_model(tems, ppts, pets, tsps, dslr)
+    m.set_parameters(np.array(params, float))
+    m.run_model()
+    otps = m.get_outputs()
+    sim  = m.get_discharge()
+    labels = m.get_output_labels()
+    nse = calc_nse(diso, sim)
+    return otps, sim, labels, {"NSE": float(nse)}
+
+
+# --- Process toggles (neutralize to disable processes) ---
+def turn_off_snow(p):
+    q = np.array(p, float)
+    q[0]=0.0; q[1]=0.0; q[2]=0.0; q[3]=0.0
+    return q
+
+def turn_off_upper_reservoir(p):
+    q = np.array(p, float)
+    q[8]=0.0; q[10]=0.0; q[11]=0.0; q[12]=0.0; q[13]=1.0; q[14]=0.0; q[15]=0.0
+    return q
+
+def turn_off_lower_reservoir(p):
+    q = np.array(p, float)
+    q[9]=0.0; q[16]=0.0; q[17]=0.0
+    return q
 
 
 def main():
+    
+    max_minutes = 30.0   # stop long DE runs by wall clock
+    max_evals   = 25000  # cap total objective calls
 
-    # Absolute path to the directory where the input data lies.
-    main_dir = Path(r'P:/Users/nafisaraihana/Downloads/hmg/test/aa_run_model.py')
-    os.chdir(main_dir)
+    data_dir = Path.home() / ... / ...
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Data folder not found: {data_dir}")
+    os.chdir(data_dir)
+    print(f"Using data from: {data_dir}")
 
-    # Read input text time series as a pandas Dataframe object and
-    # cast the index to a datetime object.
-    inp_dfe = pd.read_csv(r'time_series___24163005.csv', sep=';', index_col=0)
-    inp_dfe.index = pd.to_datetime(inp_dfe.index, format='%Y-%m-%d-%H')
+    df = pd.read_csv("time_series___24163005.csv", sep=";", index_col=0)
+    df.index = pd.to_datetime(df.index, format="%Y-%m-%d-%H")
+    cca = float(pd.read_csv("area___24163005.csv", sep=";", index_col=0).values[0, 0])
 
-    # Read the catcment area in meters squared. The first value is needed
-    # only.
-    cca_srs = pd.read_csv(r'area___24163005.csv', sep=';', index_col=0)
-    ccaa = cca_srs.values[0, 0]
+    required_cols = ["tavg__ref", "pptn__ref", "petn__ref", "diso__ref"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns: {missing}")
 
-    tems = inp_dfe.loc[:, 'tavg__ref'].values  # Temperature.
-    ppts = inp_dfe.loc[:, 'pptn__ref'].values  # Preciptiation.
-    pets = inp_dfe.loc[:, 'petn__ref'].values  # PET.
-    diso = inp_dfe.loc[:, 'diso__ref'].values  # Observed discharge.
+    tems = df["tavg__ref"].values
+    ppts = df["pptn__ref"].values
+    pets = df["petn__ref"].values
+    diso = df["diso__ref"].values
 
-    tsps = tems.shape[0]  # Number of time steps.
+    tsps = len(tems)
+    dslr = cca / (3600 * 1000)
 
-    # Conversion constant for mm/hour to m3/s.
-    dslr = ccaa / (3600 * 1000)  # For daily res. multiply denominator with 24.
+    prms0 = np.array([
+        0.00, 0.10, 0.01, 0.10,
+        0.00, 300., 70.,  2.50,
+        0.00, 0.00,
+        1.00, 0.01, 30., 0.10, 0.10, 0.01,
+        1e-3, 1e-5
+    ], dtype=float)
 
-    # Read model and related files in the models directory for more info.
-    # Correct sequence must be followed. Values that are out of
-    # the absolute parameter range will result in an AssertionError.
-    prms = np.array([
-        0.00,  # 'snw_dth'
-        +0.1,  # 'snw_att'
-        0.01,  # 'snw_pmf'
-        0.10,  # 'snw_amf'
+    # Baseline
+    m0 = build_model(tems, ppts, pets, tsps, dslr)
+    m0.set_parameters(prms0)
+    m0.run_model()
+    sim0 = m0.get_discharge()
+    base_nse = calc_nse(diso, sim0)
+    print("Baseline NSE:", round(base_nse, 4))
+    plot_obs_sim(df.index, diso, sim0, "Observed vs Simulated (Baseline)", "baseline_run.png")
 
-        0.00,  # 'sl0_dth'
-        300.,  # 'sl0_pwp'
-        70.0,  # 'sl0_fcy'
-        2.50,  # 'sl0_bt0'
+    print("\nStarting Differential Evolution calibration...\n")
 
-        0.00,  # 'urr_dth'
-        0.00,  # 'lrr_dth'
+    # Logging containers 
+    eval_params, eval_ofv = [], []
+    eval_log = []                 # every evaluation row
+    best_by_gen = []
+    best_params_by_gen = []
+    best_nse_by_gen = []
 
-        1.00,  # 'urr_wsr'
-        0.01,  # 'urr_ulc'
-        30.0,  # 'urr_tdh'
-        0.00,  # 'urr_tdr'
-        0.10,  # 'urr_ndr'
-        0.01,  # 'urr_uct'
+    # Best-so-far snapshot
+    best_solution = {"params": None, "ofv": np.inf, "metrics": None}
 
-        1e-3,  # 'lrr_dre'
-        1e-5,  # 'lrr_dct'
-        ], dtype=np.float32)
-    #==========================================================================
+    #  DE settings 
+    popsize = 12
+    n_params = len(BOUNDS)
+    pop_n = popsize * n_params         # approx trials per generation
+    eval_idx = 0
+    start_time = time.time()
 
-    # Initiate an empty model object. To understand what each method call
-    # used below is for, please take a look at the files inside models
-    # directory.
-    modl_objt = HBV001A()
+    def logged_ofv(x):
+        nonlocal eval_idx
+        ofv, metrics, _ = objective_function(x, tems, ppts, pets, tsps, dslr, diso)
+        eval_params.append(np.array(x, float))
+        eval_ofv.append(float(ofv))
+        generation = eval_idx // pop_n  # coarse mapping
+        row = {
+            "eval_idx": eval_idx,
+            "generation": generation,
+            "ofv": float(ofv),
+            "nse": float(metrics["NSE"]),
+        }
+        row.update({name: float(val) for name, val in zip(PARAM_NAMES, x)})
+        eval_log.append(row)
+        eval_idx += 1
+        return ofv
 
-    # Set the above defined inputs.
-    modl_objt.set_inputs(tems, ppts, pets)
+    def de_callback(xk, convergence):
+        # Stop on time or eval budget 
+        elapsed_min = (time.time() - start_time) / 60.0
+        if elapsed_min >= max_minutes or eval_idx >= max_evals:
+            print(f"\n Stopping early: elapsed={elapsed_min:.2f} min, evals={eval_idx}")
+            return True  # stop DE
 
-    # Pass the number of time steps to the model object here. It creates the
-    # ouputs array(s) with the proper shape.
-    modl_objt.set_outputs(tsps)
+        # Log current generation best
+        ofv, metrics, _ = objective_function(xk, tems, ppts, pets, tsps, dslr, diso)
+        best_by_gen.append(ofv)
+        best_params_by_gen.append(np.array(xk, float))
+        best_nse_by_gen.append(float(metrics["NSE"]))
 
-    # Set the constant that will convert units from those of precipitation
-    # to those of measured discharge.
-    modl_objt.set_discharge_scaler(dslr)
-    #==========================================================================
+        if ofv < best_solution["ofv"]:
+            best_solution["params"] = np.array(xk, float)
+            best_solution["ofv"] = ofv
+            best_solution["metrics"] = metrics
+            print(f"\n New best! Gen {len(best_by_gen)}: OFV={ofv:.4f}, NSE={metrics['NSE']:.4f}")
 
-    # Show the parameters against their names as a check.
-    print('')
+        print(f"Gen {len(best_by_gen):3d} | best (1-NSE) = {ofv:.6f}")
+        return False  
 
-    print('Model parameters:')
-    for prm_lbl, i in modl_objt.get_parameter_labels().items():
-        print(f'{prm_lbl}:', round(prms[i], 6))
+    res = differential_evolution(
+        logged_ofv,
+        bounds=BOUNDS,
+        strategy="best1bin",
+        maxiter=20000,                 # high cap; budget guard stops earlier
+        popsize=popsize,
+        tol=1e-4,
+        mutation=(0.5, 1.0),
+        recombination=0.7,
+        seed=42,
+        callback=de_callback,
+        polish=True,
+        updating="deferred",
+        workers=1,
+    )
 
-    print('')
+    # Final evaluation at DE-returned best
+    best_params = res.x
+    best_ofv, best_metrics, best_sim = objective_function(best_params, tems, ppts, pets, tsps, dslr, diso)
+    print("\nOptimization complete.")
 
-    # Get a dictionary that links an output labe to its column index in the
-    # ouputs array.
-    otps_lbls = modl_objt.get_output_labels()
+    # Prefer callback best; fallback to res.x
+    save_params = best_solution["params"] if best_solution["params"] is not None else best_params
+    save_ofv = best_solution["ofv"] if np.isfinite(best_solution["ofv"]) else best_ofv
+    save_metrics = best_solution["metrics"] if best_solution["metrics"] is not None else best_metrics
 
-    # Pass the parameters.
-    modl_objt.set_parameters(prms)
+    # Save best
+    np.savetxt("best_params.txt", save_params, fmt="%.6f")
+    with open("best_metrics.txt", "w") as f:
+        f.write(f"Best OFV (1-NSE): {save_ofv:.6f}\n")
+        f.write(f"NSE: {save_metrics['NSE']:.4f}\n")
 
-    # Tell the model object that the simulation is a not an optimization.
-    modl_objt.set_optimization_flag(0)
+    # Save ALL evaluations table
+    pd.DataFrame(eval_log).to_csv("de_eval_log.csv", index=False)
 
-    # Run the model for the given inputs, constants and parameters.
-    modl_objt.run_model()
+    # Save per-generation current-best table
+    if best_params_by_gen:
+        arr = np.vstack(best_params_by_gen)
+        df_best = pd.DataFrame(arr, columns=PARAM_NAMES)
+        df_best.insert(0, "generation", np.arange(len(best_params_by_gen)))
+        df_best["best_ofv"] = best_by_gen
+        df_best["best_nse"] = best_nse_by_gen
+        df_best.to_csv("de_best_by_gen.csv", index=False)
 
-    # Read the internal ouputs and simulated discharge.
-    otps = modl_objt.get_outputs()
-    diss = modl_objt.get_discharge()
-    #==========================================================================
+    print("\nSaved:")
+    print(" - best_params.txt")
+    print(" - best_metrics.txt")
+    print(" - de_eval_log.csv            (all evaluations)")
+    print(" - de_best_by_gen.csv         (current best per generation)")
 
-    if False:
-        # Show a figure of the observed vs. simulated river flow.
-        fig = plt.figure()
+    print(f"Best objective (1 - NSE): {best_ofv:.6f}")
+    print("Best-fit NSE:", round(best_metrics["NSE"], 4))
 
-        plt.plot(inp_dfe.index, diso, label='REF', alpha=0.75)
-        plt.plot(inp_dfe.index, diss, label='SIM', alpha=0.75)
+    # Plots
+    plot_obs_sim(df.index, diso, best_sim, "Observed vs Simulated (Optimized)", "optimized_run.png")
+    plot_convergence(best_by_gen, out_png="de_convergence.png")
+    plot_param_paths(best_params_by_gen, out_dir=os.getcwd(), prefix="param_path_")
 
-        plt.grid()
-        plt.legend()
+    # Internals + ablations
+    print("\n--- Internal variables with processes ON vs OFF ---")
+    otps_on, sim_on, labels, met_on = run_with_params(best_params, tems, ppts, pets, tsps, dslr, diso)
+    print(f"All ON  | NSE = {met_on['NSE']:.3f}")
+    plot_internal_vars(df.index, df, otps_on, labels,
+                       "Internal Variables — All Processes ON", "internal_all_on.png")
 
-        plt.xticks(rotation=45)
+    p_no_snow = turn_off_snow(best_params)
+    otps_ns, sim_ns, _, met_ns = run_with_params(p_no_snow, tems, ppts, pets, tsps, dslr, diso)
+    print(f"Snow OFF| NSE = {met_ns['NSE']:.3f}")
+    plot_internal_vars(df.index, df, otps_ns, labels,
+                       "Internal Variables — Snow OFF", "internal_snow_off.png")
 
-        plt.xlabel('Time [hr]')
-        plt.ylabel('Discharge\n[$m^3.s^{-1}$]')
+    p_no_lrr = turn_off_lower_reservoir(best_params)
+    otps_nl, sim_nl, _, met_nl = run_with_params(p_no_lrr, tems, ppts, pets, tsps, dslr, diso)
+    print(f"LRR OFF | NSE = {met_nl['NSE']:.3f}")
+    plot_internal_vars(df.index, df, otps_nl, labels,
+                       "Internal Variables — Lower Reservoir OFF", "internal_lrr_off.png")
 
-        plt.title('Observed vs. Simulated RIver Flow')
+    p_no_urr = turn_off_upper_reservoir(best_params)
+    otps_nu, sim_nu, _, met_nu = run_with_params(p_no_urr, tems, ppts, pets, tsps, dslr, diso)
+    print(f"URR OFF | NSE = {met_nu['NSE']:.3f}")
+    plot_internal_vars(df.index, df, otps_nu, labels,
+                       "Internal Variables — Upper Reservoir OFF", "internal_urr_off.png")
 
-        plt.show()
-        plt.close(fig)
-    #===========================================================================
+    plot_obs_sim(df.index, diso, sim_on, "Hydrograph — All ON (optimized)", "hydro_all_on.png")
+    plot_obs_sim(df.index, diso, sim_ns, "Hydrograph — Snow OFF", "hydro_snow_off.png")
+    plot_obs_sim(df.index, diso, sim_nl, "Hydrograph — LRR OFF", "hydro_lrr_off.png")
+    plot_obs_sim(df.index, diso, sim_nu, "Hydrograph — URR OFF", "hydro_urr_off.png")
 
-    # Show a figure of some of the internally simulated variables of the model.
-    # This also serves as a diagnostic tool to check whether what is simulated
-    # makes sense or not.
-    fig, axs = plt.subplots(8, 1, figsize=(4, 8), dpi=120, sharex=True)
-
-    (axs_tem,
-     axs_ppt,
-     axs_snw,
-     axs_sl0,
-     axs_etn,
-     axs_rrr,
-     axs_rnf,
-     axs_bal) = axs
-    #===========================================================================
-
-    # Inputs.
-    axs_tem.plot(inp_dfe['tavg__ref'], alpha=0.85)
-    axs_tem.set_ylabel('TEM\n[°C]')
-
-    axs_ppt.plot(inp_dfe['pptn__ref'], alpha=0.85)
-    axs_ppt.set_ylabel('PPT\n[mm]')
-    #===========================================================================
-
-    # Snow depth.
-    axs_snw.plot(inp_dfe.index, otps[:, otps_lbls['snw_dth']], alpha=0.85)
-    axs_snw.set_ylabel('SNW\n[mm]')
-    #===========================================================================
-
-    # Mositure level in both soil layers.
-    axs_sl0.plot(inp_dfe.index, otps[:, otps_lbls['sl0_dth']], alpha=0.85)
-    axs_sl0.set_ylabel('SL0\n[mm]')
-    #===========================================================================
-
-    # Potential and simulated evapotranspiration.
-    axs_etn.plot(inp_dfe.index, inp_dfe['petn__ref'], label='PET', alpha=0.85)
-
-    axs_etn.plot(
-        inp_dfe.index, otps[:, otps_lbls['sl0_etn']], label='ETN', alpha=0.85)
-
-    axs_etn.set_ylabel('ETN\n[mm]')
-    axs_etn.legend()
-    #===========================================================================
-
-    # Depth of water in the upper and lower reservoirs.
-    axs_rrr.plot(
-        inp_dfe.index, otps[:, otps_lbls['urr_dth']], label='URR', alpha=0.85)
-
-    axs_rrr.plot(
-        inp_dfe.index, otps[:, otps_lbls['lrr_dth']], label='LRR', alpha=0.85)
-
-    axs_rrr.set_ylabel('DTH\n[mm]')
-    axs_rrr.legend()
-    #===========================================================================
-
-    # Surface and underground runoff.
-    axs_rnf.plot(
-        inp_dfe.index,
-        otps[:, otps_lbls['chn_pow']],
-        label='SFC',
-        alpha=0.85)
-
-    axs_rnf.plot(
-        inp_dfe.index,
-        otps[:, otps_lbls['urr_urf']] + otps[:, otps_lbls['lrr_lrf']],
-        label='GND',
-        alpha=0.85)
-
-    axs_rnf.set_ylabel('RNF\n[mm]')
-    axs_rnf.legend()
-    #===========================================================================
-
-    # Water balance time series at each time step.
-    # Should be close to zero.
-    axs_bal.plot(inp_dfe.index, otps[:, otps_lbls['mod_bal']], alpha=0.85)
-    axs_bal.set_ylabel('BAL\n[mm]')
-    #===========================================================================
-
-    # Some other makeup.
-    for ax in axs: ax.grid()
-
-    axs[-1].set_xlabel('Time [hr]')
-
-    plt.xticks(rotation=45)
-
-    plt.suptitle('Inputs, and internally simulated variables of HBV')
-    plt.show()
-
-    plt.close(fig)
-    #===========================================================================
-    return
+    print("\n All outputs saved in:", os.getcwd())
 
 
-if __name__ == '__main__':
-    print('#### Started on %s ####\n' % time.asctime())
+
+if __name__ == "__main__":
+    print("#### Started on %s ####\n" % time.asctime())
     START = timeit.default_timer()
-
-    #==========================================================================
-    # When in post_mortem:
-    # 1. "where" to show the stack,
-    # 2. "up" move the stack up to an older frame,
-    # 3. "down" move the stack down to a newer frame, and
-    # 4. "interact" start an interactive interpreter.
-    #==========================================================================
-
-    if DEBUG_FLAG:
-        try:
-            main()
-
-        except:
-            pre_stack = tb.format_stack()[:-1]
-
-            err_tb = list(tb.TracebackException(*sys.exc_info()).format())
-
-            lines = [err_tb[0]] + pre_stack + err_tb[2:]
-
-            for line in lines:
-                print(line, file=sys.stderr, end='')
-
-            import pdb
-            pdb.post_mortem()
-    else:
+    try:
         main()
-
+    except Exception:
+        pre_stack = tb.format_stack()[:-1]
+        err_tb = list(tb.TracebackException(*sys.exc_info()).format())
+        lines = [err_tb[0]] + pre_stack + err_tb[2:]
+        for line in lines:
+            print(line, file=sys.stderr, end="")
+        raise
     STOP = timeit.default_timer()
-    print(('\n#### Done with everything on %s.\nTotal run time was'
-           ' about %0.4f seconds ####' % (time.asctime(), STOP - START)))
+    print(f"\n Done on {time.asctime()}.\nTotal runtime ≈ {STOP - START:.3f} s ####")
